@@ -3,6 +3,9 @@
 ## Project
 - Go backend service
 - Prefer standard library first. Only add third-party deps with explicit approval.
+- Approved deps (2026-10-20): `github.com/decred/dcrd/dcrec/secp256k1/v4` (secp256k1 signing),
+  `golang.org/x/crypto` (legacy Keccak-256), `github.com/coder/websocket` (WebSocket client for
+  Alchemy subscriptions and the sequencer feed).
 
 ## Commands
 - Format: `gofmt -w .` or `go fmt ./...`
@@ -24,8 +27,13 @@
 - Prefer modern idioms available in the project's Go version (from go.mod).
 
 ## Architecture
-- Handler → Service → Repository → DB
-- Handlers must not touch the database directly.
+- Source of truth: `docs/ARCHITECTURE.md` (hexagonal / ports & adapters).
+- Dependencies point inward: `internal/adapter/*` imports `internal/domain/port`;
+  `internal/domain` never imports adapters or protocol libraries.
+- `cmd/*` is the only composition root that knows concrete implementations.
+- Adapters never import each other; shared EVM primitives live in `internal/adapter/out/chain/evm`.
+- Domain services reach storage only through outbound ports (`PositionStore`, `DeployerStore`, ...).
+- Hot path (launch → decide → sign → submit) does no disk I/O; journaling is non-blocking.
 - Keep changes minimal and focused.
 
 ## Must Never
@@ -41,12 +49,16 @@
   owns the state, a channel only for real cross-goroutine signalling).
 - 解耦性 (decoupling): modules talk through small interfaces defined at the
   call site, not through concrete types. Business strategies implement
-  `strategy.Strategy` and register by name (`arbitrage`, `volume`); shared
-  services (`execution`, `risk`, `monitor`) expose ports, not internals.
+  `strategy.Strategy` and register by name (v1: `ponsv2` only); shared
+  services (`risk`, `timing`, `positions`, `monitor`) expose ports, not internals.
 - 可拓展性 (extensibility): a new capability is a new registered implementation
-  (`exchange.Venue`, `estimator.Estimator`, `strategy.Strategy`, or a future
-  `Protector`), never an edit to the core engine. Keep `engine` thin: it wires,
-  it does not implement business logic.
+  (chain by chainID, venue by `chainID:venueName`, `strategy.Strategy`,
+  `protectors.Protector`), never an edit to the core engine. Keep `engine` thin:
+  it wires, it does not implement business logic.
+- 范围 (scope): v1 targets Robinhood Chain + Pons V2 only. Do not add code for
+  other chains, launchpads, or Solana until `docs/ARCHITECTURE.md` schedules it.
+- 基础设施 (infrastructure): no self-hosted chain node. Use official endpoints
+  (sequencer, feed, public RPC) and Alchemy only.
 - Monitor is read-only: it consumes events and never sends trading commands.
   Business modules are independent in code, but share account-level risk; that
   is why risk is a cross-cutting aggregator, not a per-module feature.

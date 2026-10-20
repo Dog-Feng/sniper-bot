@@ -55,10 +55,18 @@
   (chain by chainID, venue by `chainID:venueName`, `strategy.Strategy`,
   `protectors.Protector`), never an edit to the core engine. Keep `engine` thin:
   it wires, it does not implement business logic.
-- 范围 (scope): v1 targets Robinhood Chain + Pons V2 only. Do not add code for
-  other chains, launchpads, or Solana until `docs/ARCHITECTURE.md` schedules it.
+- 范围 (scope): v1 trading targets Robinhood Chain + Pons V2 only. Do not add
+  trading code for other chains, launchpads, or Solana until `docs/ARCHITECTURE.md`
+  schedules it. Exception: `monitor` may read any EVM chain registered in config
+  (read-only, no keys for that chain).
 - 基础设施 (infrastructure): no self-hosted chain node. Use official endpoints
   (sequencer, feed, public RPC) and Alchemy only.
 - Monitor is read-only: it consumes events and never sends trading commands.
+  `internal/domain/service/monitor/...` must not import `TxSubmitter` or
+  `KeySigner` (enforced in CI via `go list -deps`). It may publish `WatchEvent`
+  facts; strategies decide what to do with them. Monitor failures or slowness
+  must never block the trading hot path.
   Business modules are independent in code, but share account-level risk; that
   is why risk is a cross-cutting aggregator, not a per-module feature.
+- Secrets (RPC keys, notifier tokens) live only in `*.local.json` / local files
+  listed in `.gitignore`; examples in `configs/*.example.json` use placeholders.

@@ -8,6 +8,7 @@
 | --- | --- | --- |
 | v1 | 2026-10-20 | 初稿：抢发射后最初几个区块、us-east-2 极限延迟路线 |
 | v2 | 2026-10-20 | 批准 WebSocket 依赖 `github.com/coder/websocket`；根据 Pons V2 狙击税（已在链上实测）重写买点模型：从"抢第一块"改为"抢税率归零的秒边界"；**不自建 Nitro 节点**（成本约束），检测改走 Alchemy WebSocket 日志订阅；新增排序器时钟校准、税率保护下单、内部盘画像、链健康熔断；v1 只做 Pons V2，删除多链/Solana 预设计；路线图新增阶段 0（回测先行） |
+| v2.1 | 2026-10-20 | 新增监控模块（第 12 节）：monitor 拆为内部观测 observe、链上监控 watch、告警 alert 三部分；支持只读监控任意 EVM 链合约（首个目标：BNB Chain 上的 TapeAI 铸造合约）；新增 `cmd/watch`、Notifier/WatchStore 端口与监控实现路线（M1~M5） |
 
 ## 1. 项目目标
 
@@ -21,6 +22,7 @@
 - 不需要预先知道项目方钱包或代币地址；代币地址从工厂事件中被动解出。
 - **先证明期望为正，再投入低延迟基础设施**（阶段 0 回测是硬门槛）。
 - **不自建链节点**：只使用官方公开端点 + Alchemy（成本约束，见 3.1）。
+- **监控是一等模块**：内部运行状态与外部链上目标（NFT 铸造、合约、钱包）统一由 monitor 观测并告警；monitor 只读，永不发交易（第 12 节）。
 
 ## 2. 目标链与 launchpad 关键事实（调研结论，2026-10）
 
@@ -149,8 +151,9 @@ amountOut = 净输入 × tokenReserve / (quoteReserve + 净输入)        // 整
   驱动适配器          │         DOMAIN（六边形内核）           │
   CLI / 管理API ────▶│                                     │◀──── RPC 网关（Alchemy/公共/排序器）
   发射事件源 ────────▶│  engine、ponsv2 策略、protectors、     │◀──── 签名器 / 密钥库
-  区块时钟源(feed) ──▶│  risk、timing、positions、monitor     │◀──── 存储 / 时钟
-  定时器 ───────────▶│                                     │
+  区块时钟源(feed) ──▶│  risk、timing、positions              │◀──── 存储 / 时钟
+  定时器 ───────────▶│  monitor（observe / watch / alert）   │◀──── 多链只读 RPC（监控目标）
+                    │                                     │◀──── 通知通道（Telegram / Webhook）
                     └────────────────────────────────────┘
 ```
 
@@ -162,6 +165,8 @@ amountOut = 净输入 × tokenReserve / (quoteReserve + 净输入)        // 整
 cmd/sniper/                          组合根：配置、装配、启动
 cmd/backfill/                        离线：发射与曲线事件回填（替代 discover_deployers.py）
 cmd/backtest/                        离线：按 Δt=k 入场 + 离场规则回测
+cmd/watch/                           只运行监控模块（交易未就绪时即可单独部署，见 12.9）
+configs/watch.example.json           监控目标配置样例（真实配置 *.local.json 不入库）
 internal/domain/                     内核，零第三方依赖
   model/                             实体与值对象（Launch、Curve、Position、Order）
   service/
@@ -172,11 +177,15 @@ internal/domain/                     内核，零第三方依赖
     risk/                            账户级风控聚合器（唯一共享状态所有者）+ 链健康熔断
     timing/                          排序器时钟偏移估计、秒边界发射调度
     positions/                       持仓与卖出规则（含毕业后路由切换）
-    monitor/                         只读观测（只写日志/指标，永不发交易指令）
+    monitor/                         只读监控（永不发交易指令，见第 12 节）
+      observe/                       内核事件 → 指标（延迟、命中率、PnL、熔断）
+      watch/                         链上目标监控：规则求值、游标推进、补齐
+      alert/                         告警分级、去重、限频、路由
   port/
     inbound/                         LaunchListener、BlockClockListener、AdminConsole、Ticker
     outbound/                        ChainReader、TxSubmitter、KeySigner、
-                                     PositionStore、DeployerStore、EventJournal、Clock
+                                     PositionStore、DeployerStore、EventJournal、Clock、
+                                     Notifier、WatchStore
 internal/adapter/
   in/
     cli/                             管理命令
@@ -184,11 +193,13 @@ internal/adapter/
     blockclock/rhc/                  sequencer feed 消息头时间戳（主）+ newHeads（兜底）
     scheduler/                       止损巡检、日损重置
   out/
-    rpc/                             多端点 JSON-RPC 网关（按用途路由、限流感知）
-    chain/evm/                       共享 EVM 原语（RLP/Keccak/EIP-1559 交易/签名）
+    rpc/                             多端点、多链 JSON-RPC 网关（按 chainID 与用途路由、限流感知）
+    chain/evm/                       共享 EVM 原语（RLP/Keccak/EIP-1559 交易/签名/最小 ABI 编解码）
     chain/rhc/                       Pons calldata 编解码、曲线与 v4 venue
     store/sqlite/                    仓库实现
     keys/file/                       密钥加密存储与签名
+    notify/telegram/                 Telegram Bot API（标准库 net/http）
+    notify/webhook/                  通用 HTTPS Webhook
 ```
 
 v1 删除的预设计：`chain/eth`、`chain/solana`、`twitter`、`v4pool`、`kol` 策略。需要时作为新包加入，不改 engine。
@@ -208,18 +219,20 @@ outbound（内核调用外部；按 `AGENTS.md` 拆成小接口）：
 
 | 端口 | 方法 | 实现适配器 |
 | --- | --- | --- |
-| ChainReader | `Call / TxByHash / Nonce / BaseFee` | rpc + chain/rhc |
+| ChainReader | `Call / TxByHash / Nonce / BaseFee / Logs / Balance / Code / StorageAt`；组合根按 chainID 注入（交易用 RHC，监控可用任意 EVM 链） | rpc + chain/* |
 | TxSubmitter | `Submit(ctx, rawTx)`（多路发送） | rpc |
 | KeySigner | `Sign(ctx, tx)` | keys/file + chain/evm |
 | PositionStore / DeployerStore | `Save / Get / List` | store/sqlite |
 | EventJournal | `Append(event)`（非阻塞，满则丢弃并计数） | store + 指标 |
 | Clock | `Now`（单调时钟 + 墙钟） | 系统时钟（测试用假钟） |
+| Notifier | `Notify(ctx, Alert)` | notify/telegram、notify/webhook |
+| WatchStore | `Cursor / SaveCursor / LastValue / SaveObservation / SaveAlert` | store/sqlite |
 
 ### 4.3 模块独立性规则
 
 1. adapter 之间禁止互相 import；共享原语放入库性质的 `chain/evm`。
 2. 模块间通信只有两种：端口调用（同步）与内核事件（异步单向）。
-3. monitor 只订阅内核事件，无任何路径可令其发出交易指令。
+3. monitor 只读：只依赖 ChainReader、WatchStore、Notifier、EventJournal、Clock；**禁止 import TxSubmitter 与 KeySigner**，CI 用 `go list -deps ./internal/domain/service/monitor/...` 校验。monitor 可以向内核发布 `WatchEvent`（事实），但不发任何指令。
 4. risk 是唯一持有账户级共享状态的服务；mutex 管共享状态，channel 管跨 goroutine 信号，所有 goroutine 以 context 取消为退出条件。
 5. 注册表：链（chainID）、venue（chainID:venueName）、策略（名称）、protector（名称）。新增能力 = 新包 + 注册，不改 engine。
 6. 热路径（发射 → 决策 → 签名 → 提交）不做磁盘 I/O；画像库启动时全量载入内存，后台增量更新。
@@ -300,6 +313,7 @@ v1 删除的检查：字节码模板指纹、可疑 opcode、买卖模拟查蜜�
 - 链健康指标：feed 落后、区块间隔异常（>1s）、提交失败率、Alchemy 推送延迟。
 - 任一超阈值：暂停开新仓，只允许平仓；恢复需连续 N 分钟正常。
 - 时钟源切换顺序：主 feed → Alchemy newHeads → 延迟 feed（慢约 500ms，只用于监控和平仓，不用于开仓定时）。
+- 熔断的触发与恢复都作为内核事件发出，由 monitor 以 critical 级别告警（12.5）。
 
 ### 5.9 程序启动时序
 
@@ -331,6 +345,7 @@ v1 删除的检查：字节码模板指纹、可疑 opcode、买卖模拟查蜜�
 - 选址实测：在 us-east-1 与 us-east-2 各开一台临时实例，测量到 `sequencer.mainnet` 的 RTT、feed 到达时间差、Alchemy WS 推送延迟，选最优可用区。在此之前，任何 RTT 数字都只是估计值。
 - 同机部署检测 + 决策 + 提交；国内/德国机器只跑离线回测与分析。
 - 主提交路径：官方排序器端点；冗余：Alchemy。
+- 监控模块对延迟不敏感：可与交易同机（独立 goroutine、独立 RPC key），也可用 `cmd/watch` 单独部署在任意低成本机器上。
 
 ## 8. 已完成的准备（资产清单）
 
@@ -352,6 +367,8 @@ v1 删除的检查：字节码模板指纹、可疑 opcode、买卖模拟查蜜�
 | 5 | positions 全套卖出（含内部人监控、毕业路由） | 主网小资金 1~2 周，实盘与回测偏差可解释 |
 | 6 | 扩展：feed 解码加速、条件买入合约、其他 launchpad、第二条链 | 每项都需回测或实测证明收益 |
 
+监控模块另走并行的 M 线（见 12.9）。M1~M3 不依赖交易路径，可以与阶段 0 同时开工；M4 随阶段 1~5 逐步接入内部指标。
+
 ## 10. 未决事项
 
 - [x] 2026-10-20 已批准：decred/secp256k1 + x/crypto（legacy Keccak-256）
@@ -363,6 +380,9 @@ v1 删除的检查：字节码模板指纹、可疑 opcode、买卖模拟查蜜�
 - [ ] 对照已验证合约 ABI 确认 CurveBuy/CurveSell 等事件签名与工厂两种 selector
 - [ ] 测试网（46630）是否部署 Pons V2；钱包与测试资金
 - [ ] 阶段 0 回测结论
+- [ ] 监控：告警通道选择（Telegram / Webhook / 邮件）与接收人
+- [ ] 监控：BNB Chain 带 key 的 RPC（公共节点拒绝 getLogs，见 12.7），先评估各家免费层
+- [ ] 监控：确认 TapeAI 各合约在 BscScan 上是否已验证源码，查明 beacon owner `0x6822…f7e2` 背后的逻辑（多签/时间锁？）
 
 ## 11. 风险与合规
 
@@ -370,3 +390,117 @@ v1 删除的检查：字节码模板指纹、可疑 opcode、买卖模拟查蜜�
 - 结构性劣势：发射方与豁免地址零税先买，我方天然是后手；protector 链与仓位纪律是生存线，不是可选项。
 - 规则风险：Pons 可能调整狙击税或发射配置；运行时用 `currentSnipeTaxBps` 校验税率表，偏离即停止开仓。
 - 预算纪律：单笔小额起步，实盘结果必须与回测对照，偏差无法解释时停止放大。
+
+## 12. 监控模块（monitor）
+
+### 12.1 定位与原则
+
+monitor 有三个职责：
+
+1. **内部观测（observe）**：消费内核事件，生成指标与日志，覆盖热路径延迟、秒边界命中率、成交与 revert、持仓、PnL、熔断状态。
+2. **链上监控（watch）**：按配置监控任意 EVM 链上的目标（NFT 铸造合约、普通合约、项目方钱包、代币），把状态、事件、余额、代码的变化转成事实事件。
+3. **告警（alert）**：对事实事件做分级、去重、限频，再路由到通知通道。
+
+原则：
+
+- **只读**：monitor 只依赖 ChainReader、WatchStore、Notifier、EventJournal、Clock，禁止 import TxSubmitter 与 KeySigner（4.3 第 3 条，CI 校验）。
+- **只产出事实，不下指令**：可以发布 `WatchEvent`（例如"paused 从 true 变为 false"）。以后如果有策略要据此交易，由策略自己订阅、自己决策，并且必须先回测；monitor 本身不变。
+- **故障隔离**：monitor 运行在独立 goroutine 上，使用独立的 RPC key 与限额。monitor 崩溃、限流或变慢都不能影响交易热路径；热路径向 monitor 投递事件一律非阻塞（满则丢弃并计数）。
+- **多链只读**：交易 v1 只在 RHC；monitor 可以读取任何在配置中注册了 chainID 与 RPC 的 EVM 链，但不持有这些链的密钥。
+
+### 12.2 数据模型
+
+```
+WatchTarget  { ID, ChainID, Label, Kind(nftmint|contract|wallet|token), Address, StartBlock, Rules[], Enabled }
+Rule         { ID, Type, Params, Severity(info|warn|critical), Cooldown }
+Observation  { TargetID, RuleID, Block, Value, ObservedAt }        // 每条规则的最新值，用于比较变化
+WatchEvent   { TargetID, RuleID, Kind, Old, New, Block, TxHash, Severity, ObservedAt }
+Alert        { Event, DedupKey, FirstSeen, LastSeen, Count, Delivered[] }
+```
+
+### 12.3 规则类型
+
+| 类型 | 机制 | 关键参数 | 典型用途 |
+| --- | --- | --- | --- |
+| StateChange | 定时 `eth_call` 读视图函数，值变化即触发 | 函数签名与返回类型、调用地址（默认目标地址）、间隔 | `paused`、价格、`owner`、beacon `implementation()` |
+| EventMatch | 按游标 `eth_getLogs` 拉取匹配事件 | topics、确认深度 | 铸造 Transfer(from=0)、`Upgraded`、`OwnershipTransferred` |
+| Counter | 对 EventMatch 计数，跨过里程碑时触发 | 总量、里程碑列表 | 铸造进度 25/50/75/90/100% |
+| BalanceFlow | 读原生币或 ERC-20 余额，按变化幅度触发 | 资产、下降/上升百分比 | 项目方提款、资金被抽走 |
+| CodeChange | 比较 `eth_getCode` 哈希、EIP-1967 槽或 beacon 实现地址 | — | 合约逻辑被替换 |
+| Market（M5） | 读取外部行情 API | 数据源、地板价阈值 | 地板价与铸造成本对比 |
+
+函数签名采用 `name(args)(returns)` 形式（如 `paused()(bool)`），由 `chain/evm` 的最小 ABI 编解码处理：v1 只支持 bool、uint256、address、bytes32、string。
+
+### 12.4 运行流程
+
+1. **启动**：加载 `configs/watch.local.json`，按 chainID 取 ChainReader，从 WatchStore 读取每个目标的游标（没有则从 `StartBlock` 开始）。
+2. **调度**：Ticker 按每条规则的间隔驱动。同一目标、同一链上的 StateChange 读取用 Multicall3 合并成一次调用。
+3. **日志拉取**：EventMatch 从游标拉到 `head − confirmations`，分段拉取。段长按端点能力自适应：失败减半，成功后缓慢增长，上限取配置里的 `maxLogRange`。一段处理完成后，与观测值一起原子推进游标。
+4. **求值与告警**：规则产出 WatchEvent，再交给 alert。`DedupKey = (target, rule, newValue)`，同一个 key 在冷却期内只计数、不重复发送。
+5. **停机补齐**：重启后按游标补拉期间的事件；补齐过程中的告警合并成一条摘要发送，避免刷屏。
+6. **区块重组**：只处理达到确认深度的区块（每条链单独配置）。RHC 使用排序器软确认。
+
+### 12.5 告警分级与通道
+
+| 级别 | 示例 | 发送方式 |
+| --- | --- | --- |
+| info | 铸造进度里程碑、每日摘要 | 合并进日报 |
+| warn | 价格变化、暂停/恢复、owner 提款、单个 RPC 端点持续失败 | 即时发送 |
+| critical | 合约逻辑升级、owner 转移、交易熔断触发、监控自身失明 | 即时发送，未确认则按间隔重复 |
+
+- 通道通过 Notifier 端口接入：`notify/telegram`（Bot API，标准库 `net/http`）与 `notify/webhook`。具体通道见第 10 节。
+- 通道凭据只放在本地配置里，不入库。
+- **自监控**：每个目标记录最近一次成功读取的时间，超过阈值（默认 5 个周期）没有成功读取，就发 critical 告警"监控失明"。
+
+### 12.6 内部观测指标（observe）
+
+| 指标 | 含义 |
+| --- | --- |
+| `launch_detect_latency_ms` | 发射区块到收到 `TokenLaunched` 的延迟 |
+| `decision_latency_ms` | 收到发射到决策完成 |
+| `boundary_error_ms` | 秒边界估计误差（5.3） |
+| `fire_outcome{hit,early_revert,late}` | 秒边界命中、早到 revert、迟到 |
+| `fill_tax_bps` | 实际成交税率 |
+| `positions_open`、`pnl_realized` | 持仓数、已实现盈亏 |
+| `rpc_errors{endpoint,code}`、`rpc_429{endpoint}` | 各端点错误与限流 |
+| `ws_reconnects`、`feed_lag_ms` | 连接稳定性 |
+| `breaker_state` | 熔断状态 |
+
+指标通过标准库 `expvar` 暴露在 `127.0.0.1` 本地 HTTP 端口上，不对外开放；关键指标同时接入告警。
+
+### 12.7 首个监控目标：TapeAI（BNB Chain）
+
+背景：TapeAI 是 BNB Chain 上固定价格的 NFT 铸造项目，地址来自其[网站配置文件](https://tapeai.net/config.js)。以下数据于 2026-10-20 用 BNB Chain 公共节点 `eth_call` 实测：
+
+| 项目 | 值 |
+| --- | --- |
+| 链 | BNB Chain 主网（chainId 56），合约部署区块 128739046 |
+| 铸造合约 minter | `0xE78f5CF50B3b8a16f600d30c603120d3f2bdb95e`：`nodePrice()` = 0.03450000000226 BNB，`paused()` = false，`MAX_PER_TX()` = 5 |
+| minter 的 owner | `0xf6133f3e6072dcb3388e50373d8b904b4759a10c`（普通钱包 EOA） |
+| 电路 NFT circuits | `0xcC6b5AcAC871bcB1f60cce29D5917266d8fb956D`，name/symbol = TapeAI / TAI，首批 8888 个 |
+| 晶体管 transistors | `0x120C1b36Bb396CA7fa7128E8c1a8D97BaEC43d27`，实测余额约 1.58 BNB |
+| 代理结构 | circuits 与 transistors 都是 295 字节的 beacon 代理，实现地址来自 beacon 的 `implementation()`。circuits 的 beacon `0xf8d6d8eb894d6971c8976ad8b4971cbefe028156`，当前实现 `0x8e1d125def6d3826c278299273a0760d47626068`；transistors 的 beacon `0xa528e147d7e065249fc52864502c9b245c6c9f66`，当前实现 `0x32e1fa125b6abe0ff12eec43e2dab482019a1e97` |
+| beacon 的 owner | 两个 beacon 同属 `0x68224f668083c29e9800be2a646d42d18cedf7e2`。它本身是一个 ERC-1967 代理合约，背后的逻辑（多签、时间锁或普通管理合约）待查 |
+| NFT 标准 | circuits 的 `supportsInterface(0x80ac58cd)` 返回 true，确认是 ERC-721 |
+
+要监控的风险点：合约逻辑可以通过 beacon 升级；beacon 的 owner 本身也是可升级代理；minter 的 owner 是单个 EOA；价格与暂停开关由合约方控制。
+
+RPC 限制（2026-10-20 实测）：公共节点上 `eth_call` 可用；但 `eth_getLogs` 宽区间查询分别被拒绝——bnbchain dataseed 返回 limit exceeded，publicnode 返回 403，drpc 返回 429，bloXroute 在 1000 块区间超时。因此 StateChange、BalanceFlow、CodeChange 用公共节点就能跑；EventMatch/Counter（铸造进度）需要带 key 的 BSC RPC（第 10 节）。
+
+配置样例见 `configs/watch.example.json`（同目录的真实配置 `watch.local.json` 不入库）。
+
+### 12.8 与狙击流程的关系
+
+- risk 的熔断触发/恢复、成交、revert、止损都会作为内核事件发出，observe 记录指标，alert 负责通知。
+- 狙击目标的部署者与豁免地址可以登记为 `kind=wallet` 的 WatchTarget，持续积累画像数据（只读）。
+- 未来如果要"根据监控事件交易"（例如 NFT 开售），按新策略处理：新包 + 注册 + 回测，monitor 不改。
+
+### 12.9 实现路线（M 线，与主路线并行）
+
+| 阶段 | 内容 | 验收 |
+| --- | --- | --- |
+| M1 | watch 骨架 + StateChange + alert（去重、冷却）+ notify/telegram + `cmd/watch` + TapeAI 配置 | 表驱动测试覆盖值变化、去重、冷却；对 TapeAI 实时读取 `paused/nodePrice/owner/implementation` 并正常推送 |
+| M2 | EventMatch + Counter + WatchStore 游标 + 自适应分段 + 停机补齐摘要 | 铸造进度与区块浏览器一致；重启后不丢、不重 |
+| M3 | BalanceFlow + CodeChange + 自监控"失明"告警 + 每日摘要 | 人为断开 RPC 能触发失明告警 |
+| M4 | observe 接入狙击内核指标（随主路线阶段 1~5） | 12.6 指标齐全，熔断事件能到达通知通道 |
+| M5（可选） | Market 规则（地板价 vs 成本） | 先确认二级市场数据源 |

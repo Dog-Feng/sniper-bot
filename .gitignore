@@ -7,3 +7,6 @@ temp/
 # 本地数据工件（不属于文档）
 deployers.csv
 pons_launches_evidence.json
+
+# 监控本地配置（含 RPC key 与通知凭据）
+configs/*.local.json

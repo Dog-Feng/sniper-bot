@@ -1,0 +1,154 @@
+{
+  "chains": {
+    "56": {
+      "name": "bsc",
+      "rpc": [
+        "<带 key 的 BSC RPC，写在 watch.local.json>",
+        "https://bsc-dataseed.bnbchain.org"
+      ],
+      "confirmations": 3,
+      "maxLogRange": 1000,
+      "multicall3": "0xcA11bde05977b3631167028862bE2a173976CA11"
+    }
+  },
+  "notify": {
+    "telegram": {
+      "botToken": "<写在 watch.local.json>",
+      "chatID": "<写在 watch.local.json>"
+    }
+  },
+  "targets": [
+    {
+      "id": "tapeai-minter",
+      "chainID": 56,
+      "label": "TapeAI 铸造合约",
+      "kind": "nftmint",
+      "address": "0xE78f5CF50B3b8a16f600d30c603120d3f2bdb95e",
+      "startBlock": 128739046,
+      "rules": [
+        {
+          "id": "paused",
+          "type": "StateChange",
+          "call": "paused()(bool)",
+          "everySec": 15,
+          "severity": "warn"
+        },
+        {
+          "id": "price",
+          "type": "StateChange",
+          "call": "nodePrice()(uint256)",
+          "everySec": 60,
+          "severity": "warn"
+        },
+        {
+          "id": "owner",
+          "type": "StateChange",
+          "call": "owner()(address)",
+          "everySec": 60,
+          "severity": "critical"
+        },
+        {
+          "id": "maxPerTx",
+          "type": "StateChange",
+          "call": "MAX_PER_TX()(uint256)",
+          "everySec": 300,
+          "severity": "info"
+        }
+      ]
+    },
+    {
+      "id": "tapeai-circuits",
+      "chainID": 56,
+      "label": "TapeAI 电路 NFT",
+      "kind": "nftmint",
+      "address": "0xcC6b5AcAC871bcB1f60cce29D5917266d8fb956D",
+      "startBlock": 128739046,
+      "rules": [
+        {
+          "id": "mint-progress",
+          "type": "Counter",
+          "event": "Transfer(address indexed from,address indexed to,uint256 indexed tokenId)",
+          "match": {
+            "from": "0x0000000000000000000000000000000000000000"
+          },
+          "total": 8888,
+          "milestones": [
+            0.25,
+            0.5,
+            0.75,
+            0.9,
+            1.0
+          ],
+          "severity": "info"
+        },
+        {
+          "id": "impl",
+          "type": "StateChange",
+          "callAddress": "0xf8d6d8eb894d6971c8976ad8b4971cbefe028156",
+          "call": "implementation()(address)",
+          "everySec": 30,
+          "severity": "critical"
+        },
+        {
+          "id": "beacon-owner",
+          "type": "StateChange",
+          "callAddress": "0xf8d6d8eb894d6971c8976ad8b4971cbefe028156",
+          "call": "owner()(address)",
+          "everySec": 60,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "id": "tapeai-transistors",
+      "chainID": 56,
+      "label": "TapeAI 晶体管合约",
+      "kind": "contract",
+      "address": "0x120C1b36Bb396CA7fa7128E8c1a8D97BaEC43d27",
+      "startBlock": 128739046,
+      "rules": [
+        {
+          "id": "impl",
+          "type": "StateChange",
+          "callAddress": "0xa528e147d7e065249fc52864502c9b245c6c9f66",
+          "call": "implementation()(address)",
+          "everySec": 30,
+          "severity": "critical"
+        },
+        {
+          "id": "balance",
+          "type": "BalanceFlow",
+          "asset": "native",
+          "dropPct": 20,
+          "everySec": 60,
+          "severity": "warn"
+        },
+        {
+          "id": "beacon-owner",
+          "type": "StateChange",
+          "callAddress": "0xa528e147d7e065249fc52864502c9b245c6c9f66",
+          "call": "owner()(address)",
+          "everySec": 60,
+          "severity": "critical"
+        }
+      ]
+    },
+    {
+      "id": "tapeai-beacon-admin",
+      "chainID": 56,
+      "label": "TapeAI beacon owner（ERC-1967 代理）",
+      "kind": "contract",
+      "address": "0x68224f668083c29e9800be2a646d42d18cedf7e2",
+      "startBlock": 128739046,
+      "rules": [
+        {
+          "id": "impl-slot",
+          "type": "CodeChange",
+          "slot": "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
+          "everySec": 60,
+          "severity": "critical"
+        }
+      ]
+    }
+  ]
+}

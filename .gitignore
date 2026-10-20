@@ -1,0 +1,9 @@
+# 密钥与本地配置（绝不入库）
+alchemy_rpc.txt
+
+# 临时目录
+temp/
+
+# 本地数据工件（不属于文档）
+deployers.csv
+pons_launches_evidence.json

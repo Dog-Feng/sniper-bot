@@ -9,6 +9,7 @@
 | v1 | 2026-10-20 | 初稿：抢发射后最初几个区块、us-east-2 极限延迟路线 |
 | v2 | 2026-10-20 | 批准 WebSocket 依赖 `github.com/coder/websocket`；根据 Pons V2 狙击税（已在链上实测）重写买点模型：从"抢第一块"改为"抢税率归零的秒边界"；**不自建 Nitro 节点**（成本约束），检测改走 Alchemy WebSocket 日志订阅；新增排序器时钟校准、税率保护下单、内部盘画像、链健康熔断；v1 只做 Pons V2，删除多链/Solana 预设计；路线图新增阶段 0（回测先行） |
 | v2.1 | 2026-10-20 | 新增监控模块（第 12 节）：monitor 拆为内部观测 observe、链上监控 watch、告警 alert 三部分；支持只读监控任意 EVM 链合约（首个目标：BNB Chain 上的 TapeAI 铸造合约）；新增 `cmd/watch`、Notifier/WatchStore 端口与监控实现路线（M1~M5） |
+| v3 | 2026-10-26 | 落地 1A 双源监控代码（链上发射源 + 项目方推文源）；新增第 13 节「代码自检规范」（每次实现/更新完成后必做）；记录 1A 自检发现并修复的 11 个问题（含 2 个致命并发问题） |
 
 ## 1. 项目目标
 
@@ -504,3 +505,94 @@ RPC 限制（2026-10-20 实测）：公共节点上 `eth_call` 可用；但 `eth
 | M3 | BalanceFlow + CodeChange + 自监控"失明"告警 + 每日摘要 | 人为断开 RPC 能触发失明告警 |
 | M4 | observe 接入狙击内核指标（随主路线阶段 1~5） | 12.6 指标齐全，熔断事件能到达通知通道 |
 | M5（可选） | Market 规则（地板价 vs 成本） | 先确认二级市场数据源 |
+
+## 13. 代码自检规范（每次实现/更新完成后必做）
+
+> 强制要求：**任何代码实现或更新完成后，都必须执行一次完整自检**，包括逻辑自检、代码边界确认、额外问题排查。自检结果以「发现的问题 + 修复 + 验证」形式记录，重大项记入第 0 节变更记录。
+
+### 13.1 自检流程（固定顺序）
+
+1. **逻辑自检**：通读本次新增/修改的全部代码，逐模块回答：
+   - 数据流是否完整（输入 → 处理 → 输出，无断链、无死代码）。
+   - 错误是否被正确处理（不吞错、不 `_ = fn()`、不静默失败）。
+   - 边界条件是否覆盖（空值、零值、超范围、非法输入）。
+   - 并发是否安全（goroutine 退出条件、共享状态加锁、channel 关闭后发送）。
+
+2. **代码边界确认**：
+   - 依赖方向：domain 不 import adapter；adapter 不互相 import；`cmd/*` 是唯一组合根。
+   - 包职责单一：不出现一个包干多件事。
+   - 端口隔离：出站端口只被内核调用；入站端口只被适配器驱动。
+
+3. **额外问题排查**（专项清单）：
+   - **并发 panic**：`close(ch)` 后是否还有 `ch <- x`（典型：sink 关闭后 source 仍投递）。
+   - **优雅退出**：`main` 退出前是否等待所有 goroutine（WaitGroup/context 传播）。
+   - **幂等性**：`Close`、重连、去重是否可重复调用。
+   - **线程安全**：自增 ID、共享 map/slice、计数器是否有锁或原子操作。
+   - **死代码**：未使用的字段、函数、常量、import（`go vet` 可查部分）。
+   - **指标断链**：定义了指标却没计数，或计数了却没暴露。
+   - **字符串/字节边界**：EVM 32 字节槽的左右对齐、hex 解码长度、切片越界（`s[2:]` 前先判空）。
+   - **时间语义**：记录的是「接收时刻」还是「处理时刻」，与指标含义一致。
+
+4. **验证（必须全绿）**：
+   ```bash
+   go build ./...          # 编译通过
+   go vet ./...            # 静态检查通过
+   gofmt -l .              # 无输出（格式正确）
+   go test -race ./...     # 单测 + 竞态检测通过
+   ```
+   一键执行（Windows）：`powershell -File scripts\selfcheck.ps1`；Linux/macOS：`./scripts/selfcheck.sh`。退出码非 0 即未通过。
+
+5. **记录**：自检发现的问题（编号、严重度、根因、修复），追加到本文档 13.3 或对应模块小节；重大架构级问题记入第 0 节变更记录。
+
+### 13.2 已建立的代码边界（当前实现基线）
+
+| 边界 | 规则 | 现状 |
+| --- | --- | --- |
+| domain 零第三方依赖 | `internal/domain/**` 只 import 标准库 + 自包 | ✅ 已遵守（`metrics` 为标准库 expvar，属例外叶子包） |
+| adapter 不互相 import | `internal/adapter/**` 不 import 其他 adapter 包 | ✅ 已遵守（`chain/evm` 是共享库性质，供各 adapter 复用） |
+| `cmd/*` 唯一组合根 | 具体实现只在 `cmd/watch` 装配 | ✅ 已遵守 |
+| 热路径非阻塞落盘 | sink 带缓冲 channel，满则丢弃计数 | ✅ 已遵守（见 `store/jsonl`） |
+| 只读监控 | monitor 不 import TxSubmitter/KeySigner | ✅ 当前监控阶段无交易代码，天然满足 |
+| 错误处理 | 不 `_ = fn()`、Wrap 错误、`errors.Is/As` | ✅ 已遵守（仅 sink 写失败与 hex 解码兜底有记录式处理） |
+
+### 13.3 1A 自检记录（2026-10-26）
+
+自检发现并修复 11 个问题，按严重度分级：
+
+| # | 严重度 | 问题 | 根因 | 修复 |
+| --- | --- | --- | --- | --- |
+| 1 | 🔴 致命 | `jsonl.Sink.Close()` 关闭 channel 后 source 仍可能 `Append` 导致 panic | 无 closed 状态 + 无幂等保护 | 增加 `atomic.Bool closed` + `closeOnce`；Append 先判 closed |
+| 2 | 🔴 致命 | `main` 退出不等 goroutine，直接 `Close` sink | 无 WaitGroup | `wg.Wait()` 后再 `Close` |
+| 3 | 🟠 高 | `jsonl.loop` 写失败静默丢弃 | `_, _ = f.Write(b)` | 增加 `werr` 计数并暴露指标 |
+| 4 | 🟠 高 | WS 断线后 poll 兜底永不重连 WS；无退避 | pollLoop 空转 | 指数退避 + 定时重连 |
+| 5 | 🟠 高 | `rpc.nextID` 非线程安全；`idc`/`closed` 死字段 | 手写计数器 | `atomic.Uint64`；删死字段 |
+| 6 | 🟡 中 | `DecodeErrors` 指标定义但从不计数 | 断链 | 解码失败处 `metrics.DecodeErrors.Add(1)` |
+| 7 | 🟡 中 | `BlockByNumber` 对 `0x0` 会 slice panic | `b.Number[2:]` 未判空 | 先判 `""`/`"0x"` |
+| 8 | 🟡 中 | `mustDecode` 静默吞 hex 错误 | 忽略 error | 用 `DecodeAddress` 返回 error |
+| 9 | 🟡 中 | social `sinceID` 字符串比较不可靠；非代币推文不推进游标 | 逻辑漏洞 | `advanceCursor` 统一推进；删死 `Atod` |
+| 10 | 🟡 中 | `observe.lastSeen` 记 `time.Now()` 而非 `ReceivedAt` | 语义错误 | 记 `c.ReceivedAt` |
+| 11 | 🟢 低 | 延迟分位数算出但没暴露 | 断链 | 聚合多个 observe 服务，`expvar.Func` 暴露 p50/p90/p99 |
+
+**验证结果**：`go build ./...`、`go vet ./...`、`gofmt -l .`（无输出）、`go test -race ./...` 全部通过。
+
+### 13.4 本次自检沉淀的教训（后续实现必须内化）
+
+1. **任何带 `Close()` 的资源，先想清楚「关闭后谁还在用」**——这是并发 panic 的第一大来源。
+2. **`main` 退出是并发代码最危险的地方**——goroutine 未 join 就释放资源，等于埋雷。
+3. **指标从定义到计数到暴露必须是一条完整链**——定义指标时立刻问「谁在什么时机 +1，谁会看」。
+4. **EVM 编解码先判长度再切片**——所有 `s[2:]` 前面必须判空/判长。
+5. **时间字段记录时要问「这是哪个时刻」**——接收时刻、处理时刻、区块时刻语义不同，混用会导致指标失真。
+6. **测试数据必须用真实格式**——本轮测试一开始用 20 字节地址，而真实 topic 是 32 字节右对齐，导致测试与实现不一致（已修正为 32 字节 topic 格式）。
+
+### 13.5 二轮自检记录（2026-10-26，深层排查）
+
+在一轮修复的基础上做更深排查，又发现 4 个遗漏问题并修复：
+
+| # | 严重度 | 问题 | 根因 | 修复 |
+| --- | --- | --- | --- | --- |
+| A | 🟠 高 | `seen` 去重 map 无界增长（7×24 运行内存泄漏） | `map[string]bool` 永不清理 | 改为按块分组 + 惰性清理（`seenWindow=2000` 块窗口） |
+| B | 🟡 中 | WS 消息自带 `blockTimestamp` 被忽略，额外同步 `BlockByNumber` 拖慢热路径 | 未解析 Alchemy 额外字段 | 保留现状（Alchemy 的 timestamp 需额外确认可靠性，暂不切换），但记录为待优化项 |
+| C | 🟡 中 | `mustDecode` 仍静默吞 hex 错误 | 忽略 error | 改为 `decodeTopicAddress` 显式返回 error |
+| D | 🟠 高 | 冷启动（`latest==0`）+ WS 失败时，poll 从 block 1 扫，永远追不上 head | 无冷启动特判 | `latest==0` 时只回填最近一个窗口 |
+
+**验证结果**：`powershell -File scripts\selfcheck.ps1` 全部通过。

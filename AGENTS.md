@@ -12,6 +12,8 @@
 - Vet: `go vet ./...`
 - Test: `go test -race ./...`
 - Lint: `golangci-lint run` (if configured)
+- Self-check (mandatory after every code change): `./scripts/selfcheck.sh` (Linux) or
+  `powershell -File scripts\selfcheck.ps1` (Windows). See `docs/ARCHITECTURE.md` §13.
 
 ## Go Style (must follow)
 - Use `gofmt` / `goimports`. No style debates.

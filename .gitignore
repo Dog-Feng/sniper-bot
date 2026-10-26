@@ -8,5 +8,13 @@ temp/
 deployers.csv
 pons_launches_evidence.json
 
+# 部署者发现脚本（未入库，计划由 cmd/backfill 替代，见 ARCHITECTURE.md §8）
+discover_deployers.py
+
 # 监控本地配置（含 RPC key 与通知凭据）
 configs/*.local.json
+
+# 本地数据工件（监控输出）
+candidates.jsonl
+watch.exe
+watch

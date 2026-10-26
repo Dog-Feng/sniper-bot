@@ -1,0 +1,9 @@
+# 强制 LF 行尾：保证 Linux 部署时 .sh 脚本与 Go 源码行为一致
+* text=auto
+
+*.sh text eol=lf
+*.go text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
